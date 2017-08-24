@@ -148,6 +148,21 @@ class ACGAN():
               out_dir,
               model_dir=None, save_every=10,
               resume=False, reduce_on_plateau=False, schedule={}, quick_run=False):
+        """
+        it_train: training iterator which only returns in-distribution examples
+          (and their corresponding classes)
+        it_val:
+        it_train_binary: training iterator which returns in and out-of-distribution examples
+          (and binary class, so 0 = OOD, 1 = ID)
+        num_epochs:
+        out_dir:
+        model_dir:
+        save_every:
+        resume:
+        reduce_on_plateau:
+        schedule:
+        quick_run:
+        """
         def _loop(fn, itr):
             rec = [ [] for i in range(len(self.train_keys)) ]
             for b in range(itr.N // itr.bs):
@@ -166,10 +181,9 @@ class ACGAN():
             header.append("train_%s" % key)
         for key in self.train_keys:
             header.append("valid_%s" % key)
-        header.append("train_accuracy_0")
-        header.append("train_accuracy_1")        
-        header.append("valid_accuracy_0")
-        header.append("valid_accuracy_1")        
+        for key in ["train_score_0", "train_score_1", "train_score_noise", "valid_score_0", "valid_score_1", "valid_score_noise"]:
+            header.append(key)
+            header.append(key + "_std")
         header.append("lr")
         header.append("time")
         if not os.path.exists(out_dir):
@@ -210,24 +224,23 @@ class ACGAN():
                 # binary validation
                 # TODO make cleaner
                 def _loop_binary(itr):
-                    zero_acc, one_acc = [], []
+                    zero_scores, one_scores, noise_scores = [], [], []
                     for b in range(itr.N // itr.bs):
                         this_x, this_y = itr.next()
                         assert np.min(this_y) == 0 and np.max(this_y) == 1
                         this_pred = self.disc_fn_det(this_x)
-                        preds_with_gt_0 = this_pred[ this_y == 0 ]
-                        preds_with_gt_1 = this_pred[ this_y == 1 ]
-                        acc_0 = (preds_with_gt_0 < 0.5).mean()
-                        acc_1 = (preds_with_gt_1 >= 0.5).mean()
-                        zero_acc.append(acc_0)
-                        one_acc.append(acc_1)
-                    return np.mean(zero_acc), np.mean(one_acc)
-                train_0_acc, train_1_acc = _loop_binary(it_train_binary)
-                val_0_acc, val_1_acc = _loop_binary(it_val_binary)
-                out_str.append(str(train_0_acc))
-                out_str.append(str(train_1_acc))
-                out_str.append(str(val_0_acc))
-                out_str.append(str(val_1_acc))
+                        preds_with_gt_0 = this_pred[ this_y == 0 ] ## what if empty??
+                        preds_with_gt_1 = this_pred[ this_y == 1 ] ## ??
+                        zero_scores += preds_with_gt_0.flatten().tolist()
+                        one_scores += preds_with_gt_1.flatten().tolist()
+                        noise = floatX(np.random.normal(0,0.1,size=(itr.bs, 1 if self.is_grayscale else 3, self.in_shp, self.in_shp)))
+                        noise_pred = self.disc_fn_det(noise)
+                        noise_scores += noise_pred.flatten().tolist()
+                    return np.mean(zero_scores), np.std(zero_scores), np.mean(one_scores), np.std(one_scores), np.mean(noise_scores), np.std(noise_scores)
+                for elem in _loop_binary(it_train_binary):
+                    out_str.append(str(elem))
+                for elem in _loop_binary(it_val_binary):
+                    out_str.append(str(elem))
                 out_str.append(str(self.lr.get_value()))
                 out_str.append(str(time()-t0))
                 out_str = ",".join(out_str)
@@ -290,6 +303,47 @@ def build_critic(in_shp, is_grayscale, num_classes, out_nonlinearity):
     l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
     l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
     return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
+
+def build_critic2(in_shp, is_grayscale, num_classes, out_nonlinearity):
+    lrelu = LeakyRectify(0.2)
+    # input: (None, 1, 28, 28)
+    layer = InputLayer(shape=(None, 1 if is_grayscale else 3, in_shp, in_shp))
+    # two convolutions
+    layer = batch_norm(Conv2DLayer(layer, 64, 3, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    layer = batch_norm(Conv2DLayer(layer, 128, 3, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    layer = batch_norm(Conv2DLayer(layer, 256, 3, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    layer = batch_norm(Conv2DLayer(layer, 512, 3, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    # fully-connected layer
+    layer = batch_norm(DenseLayer(layer, 512, nonlinearity=lrelu))
+    # output layer for real/not real
+    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity)
+    l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
+    l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
+    return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
+
+
+def build_critic3(in_shp, is_grayscale, num_classes, out_nonlinearity):
+    lrelu = LeakyRectify(0.2)
+    # input: (None, 1, 28, 28)
+    layer = InputLayer(shape=(None, 1 if is_grayscale else 3, in_shp, in_shp))
+    # two convolutions
+    layer = batch_norm(Conv2DLayer(layer, 64, 5, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    layer = batch_norm(Conv2DLayer(layer, 128, 5, stride=2, pad='same',
+                                   nonlinearity=lrelu))
+    # fully-connected layer
+    layer = batch_norm(DenseLayer(layer, 512, nonlinearity=lrelu))
+    # output layer for real/not real
+    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity)
+    l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
+    l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
+    return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
+
+
 
 class MnistIterator():
     def __init__(self, mode, bs, binary=False):
@@ -359,22 +413,52 @@ if __name__ == '__main__':
         itr_valid = MnistIterator('valid', 128) # 1..9 valid
         itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
         itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
-        name = "test1b_fixd.shuffle.repeat2"
+        name = "test1b_fixd.shuffle.repeat5"
         if mode == 'train':
             md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
         else:
             pass
 
+    def test1b_c2(mode):
+        assert mode in ['train', 'dump']
+        md = ACGAN(build_generator, {}, build_critic2, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.1)
+        itr_train = MnistIterator('train', 128) # 1..9 train
+        itr_valid = MnistIterator('valid', 128) # 1..9 valid
+        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
+        name = "test1b_fixd.shuffle.repeat3.c2"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+    def test1b_c3(mode):
+        assert mode in ['train', 'dump']
+        md = ACGAN(build_generator, {}, build_critic3, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.1)
+        itr_train = MnistIterator('train', 128) # 1..9 train
+        itr_valid = MnistIterator('valid', 128) # 1..9 valid
+        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
+        name = "test1b_fixd.shuffle.repeat3.c3"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+        
     def test1b_nocls(mode):
         assert mode in ['train', 'dump']
         md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
                    latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.0)
         itr_train = MnistIterator('train', 128)
         itr_valid = MnistIterator('valid', 128)
+        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train        
         itr_valid_disc = MnistIterator('valid', 128, binary=True)
-        name = "test1b_fixd.shuffle.repeat.nocls"
+        name = "test1b_fixd.shuffle.repeat3.nocls"
         if mode == 'train':
-            md.train(itr_train, itr_valid, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
 
         
     #test1b('train')
