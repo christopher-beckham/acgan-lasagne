@@ -388,10 +388,17 @@ class MnistIterator():
                 y_buf = np.hstack((y_buf, self.y_dat[ self.y_dat == cls ]))
         X_buf = np.asarray(X_buf, dtype=self.X_dat.dtype)
         y_buf = np.asarray(y_buf, dtype=self.y_dat.dtype)
+        # we must remap the classes now, e.g. [2,5,6] -> [0,1,2]
+        dd = {}
+        for i in range(len(target_set)):
+            dd[ target_set[i] ] = i
         if make_binary:
             # if cls in set0 then set -> 0, else set -> 1
             for i in range(len(y_buf)):
                 y_buf[i] = 1 if y_buf[i] in set1 else 0
+        else:
+            for i in range(len(y_buf)):
+                y_buf[i] = dd[y_buf[i]]
         self.X_dat = X_buf
         self.y_dat = y_buf
         self.N = self.X_dat.shape[0]
@@ -399,6 +406,7 @@ class MnistIterator():
         self.make_binary = make_binary
         self.itr = self._iterate()
         self.num_classes = len(target_set)
+        self.target_set = target_set
         print "X, y shapes =", self.X_dat.shape, self.y_dat.shape
     def _iterate(self):
         while True:
@@ -412,6 +420,7 @@ class MnistIterator():
                     this_y = floatX(this_y.reshape((len(this_y),1)))
                 else:
                     this_y = floatX(np.eye(self.num_classes)[this_y])
+                    
                 this_x = floatX(self.X_dat[b*self.bs:(b+1)*self.bs])
                 yield this_x, this_y
     def __iter__(self):
