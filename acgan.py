@@ -41,7 +41,7 @@ class ACGAN():
                  in_shp, is_grayscale,
                  cls_lambda=1.,
                  opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-3))},
-                 lsgan=False, verbose=True):
+                 lsgan=False, abc=(1,0,1), verbose=True):
         self.is_grayscale = is_grayscale
         self.in_shp = in_shp
         self.latent_dim = latent_dim
@@ -80,11 +80,11 @@ class ACGAN():
         # auxiliary
         disc_latent_out_det = get_output(discriminator['out_disc'].input_layer, x, deterministic=True)
         # distinguish between real and fake, and also classify the data correctly
-        disc_loss = adv_loss(disc_out_real, 1.).mean() + adv_loss(disc_out_gen, 0.).mean()
+        disc_loss = adv_loss(disc_out_real, abc[0]).mean() + adv_loss(disc_out_gen, abc[1]).mean()
         if cls_lambda > 0.:
             disc_loss += cls_lambda*categorical_crossentropy(cls_out, y).mean()
         # fool disc into thinking it's real, and also try and fool the classifier
-        gen_loss = adv_loss(disc_out_gen, 1.).mean()
+        gen_loss = adv_loss(disc_out_gen, abc[2]).mean()
         if cls_lambda > 0.:
             gen_loss += cls_lambda*categorical_crossentropy(cls_out_fake, yfake).mean()
         # updates
@@ -346,34 +346,59 @@ def build_critic3(in_shp, is_grayscale, num_classes, out_nonlinearity):
 
 
 class MnistIterator():
-    def __init__(self, mode, bs, binary=False):
+    def __init__(self, dataset, bs, set1=(0,), set2=(1,2,3,4,5,6,7,8,9,), mode='set1_mc' ):
         """
-        mode: train, valid, or test?
+        dataset: train, valid, or test?
         bs: batch size
-        binary: binary iterator
+        set1: which examples are out-of-distribution?
+        set2: which examples are in-distribution?
+        which_set: yield set 0 (only anom. examples) or set 1 (only in-dist examples),
+          or set 2 (yield both sets)
+        make_binary: if True then all classes in set1 will be class 0, and all classes
+          in set2 will be class 1
         returns: an iterator
         """
-        assert mode in ['train', 'valid', 'test']
+        assert dataset in ['train', 'valid', 'test']
+        assert mode in ['set1_mc', 'set2_mc', 'set12_binary'] # TODO: this is fugly
         from load_mnist import load_dataset
         X_train, y_train, X_valid, y_valid, X_test, y_test = load_dataset()
-        if mode == 'train':
+        if dataset == 'train':
             self.X_dat, self.y_dat = X_train, y_train
-        elif mode == 'valid':
+        elif dataset == 'valid':
             self.X_dat, self.y_dat = X_valid, y_valid
         else:
             self.X_dat, self.y_dat = X_test, y_test
-        if not binary:
-            # remove class 0
-            self.X_dat = self.X_dat[ self.y_dat != 0 ]
-            self.y_dat = self.y_dat[ self.y_dat != 0 ]
-            self.y_dat = self.y_dat-1
+        make_binary = False
+        if mode == 'set1_mc':
+            target_set = set1
+        elif mode == 'set2_mc':
+            target_set = set2
         else:
-            # y is now a binary vector, but we keep both classes
-            self.y_dat = (self.y_dat > 0).astype("uint8")
+            target_set = tuple(list(set1) + list(set2))
+            make_binary = True
+        # X_buf, y_buf will accumulate the digits corresponding
+        # to the classes we're interested in
+        X_buf, y_buf = [], []
+        for idx, cls in enumerate(target_set):
+            if idx==0:
+                X_buf = self.X_dat[ self.y_dat == cls ]
+                y_buf = self.y_dat[ self.y_dat == cls ]
+            else:
+                X_buf = np.vstack((X_buf, self.X_dat[ self.y_dat == cls ]))
+                y_buf = np.hstack((y_buf, self.y_dat[ self.y_dat == cls ]))
+        X_buf = np.asarray(X_buf, dtype=self.X_dat.dtype)
+        y_buf = np.asarray(y_buf, dtype=self.y_dat.dtype)
+        if make_binary:
+            # if cls in set0 then set -> 0, else set -> 1
+            for i in range(len(y_buf)):
+                y_buf[i] = 1 if y_buf[i] in set1 else 0
+        self.X_dat = X_buf
+        self.y_dat = y_buf
         self.N = self.X_dat.shape[0]
         self.bs = bs
-        self.binary = binary
+        self.make_binary = make_binary
         self.itr = self._iterate()
+        self.num_classes = len(target_set)
         print "X, y shapes =", self.X_dat.shape, self.y_dat.shape
     def _iterate(self):
         while True:
@@ -383,10 +408,10 @@ class MnistIterator():
             self.y_dat = self.y_dat[idxs]
             for b in range(self.X_dat.shape[0] // self.bs):
                 this_y = self.y_dat[b*self.bs:(b+1)*self.bs]
-                if not self.binary:
-                    this_y = floatX(np.eye(9)[this_y])
-                else:
+                if self.make_binary or self.num_classes==1:
                     this_y = floatX(this_y.reshape((len(this_y),1)))
+                else:
+                    this_y = floatX(np.eye(self.num_classes)[this_y])
                 this_x = floatX(self.X_dat[b*self.bs:(b+1)*self.bs])
                 yield this_x, this_y
     def __iter__(self):
@@ -395,15 +420,21 @@ class MnistIterator():
         return self.itr.next()
 
 if __name__ == '__main__':
+    
 
 
-    """
-    itr_valid_disc = MnistIterator('valid', 128, binary=True)
-    for xx, yy in itr_valid_disc:
-        print xx.shape, yy.shape
-        print yy
-        break
-    """
+    def test_iterator(mode):
+        itr_valid_disc = MnistIterator(
+            mode='valid',
+            bs=32,
+            set1=(0,1,2),
+            set2=(3,4,5,),
+            which_set=3)
+        for xx, yy in itr_valid_disc:
+            print xx.shape, yy.shape
+            print yy
+            break
+
 
     def test1b(mode):
         assert mode in ['train', 'dump']
@@ -411,14 +442,68 @@ if __name__ == '__main__':
                    latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.1)
         itr_train = MnistIterator('train', 128) # 1..9 train
         itr_valid = MnistIterator('valid', 128) # 1..9 valid
-        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
-        itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
+        itr_train_disc = MnistIterator('train', 128, make_binary=True) # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, make_binary=True) # 0/1 valid
         name = "test1b_fixd.shuffle.repeat5"
         if mode == 'train':
             md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
         else:
             pass
 
+
+    def test1b_1vsall(mode):
+        """
+        1 vs rest
+        """
+        assert mode in ['train', 'dump']
+        id_ = (1,)
+        ood_ = (0,2,3,4,5,6,7,8,9,)
+        md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True, lsgan=True,
+                   cls_lambda=0.)
+        itr_train = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
+        name = "test1b_1vsall"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+
+
+        
+    def test1b_margin(mode):
+        assert mode in ['train', 'dump']
+        md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.1, abc=(1,-1,1))
+        itr_train = MnistIterator('train', 128) # 1..9 train
+        itr_valid = MnistIterator('valid', 128) # 1..9 valid
+        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
+        name = "test1b_fixd.shuffle.repeat5.margin"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+    def test1b_margin2(mode):
+        assert mode in ['train', 'dump']
+        md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=9, in_shp=28, is_grayscale=True, lsgan=True, cls_lambda=0.1, abc=(3,-3,3))
+        itr_train = MnistIterator('train', 128) # 1..9 train
+        itr_valid = MnistIterator('valid', 128) # 1..9 valid
+        itr_train_disc = MnistIterator('train', 128, binary=True) # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, binary=True) # 0/1 valid
+        name = "test1b_fixd.shuffle.repeat5.margin2"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+
+        
     def test1b_c2(mode):
         assert mode in ['train', 'dump']
         md = ACGAN(build_generator, {}, build_critic2, {'out_nonlinearity':linear},
