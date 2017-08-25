@@ -390,13 +390,13 @@ class MnistIterator():
         y_buf = np.asarray(y_buf, dtype=self.y_dat.dtype)
         # we must remap the classes now, e.g. [2,5,6] -> [0,1,2]
         dd = {}
-        for i in range(len(target_set)):
-            dd[ target_set[i] ] = i
         if make_binary:
             # if cls in set0 then set -> 0, else set -> 1
             for i in range(len(y_buf)):
                 y_buf[i] = 1 if y_buf[i] in set1 else 0
         else:
+            for i in range(len(target_set)):
+                dd[ target_set[i] ] = i
             for i in range(len(y_buf)):
                 y_buf[i] = dd[y_buf[i]]
         self.X_dat = X_buf
@@ -434,11 +434,11 @@ if __name__ == '__main__':
 
     def test_iterator(mode):
         itr_valid_disc = MnistIterator(
-            mode='valid',
+            dataset='valid',
             bs=32,
             set1=(0,1,2),
             set2=(3,4,5,),
-            which_set=3)
+            mode='set12_binary')
         for xx, yy in itr_valid_disc:
             print xx.shape, yy.shape
             print yy
