@@ -39,9 +39,8 @@ class ACGAN():
                  latent_dim,
                  num_classes,
                  in_shp, is_grayscale,
-                 cls_lambda=1.,
                  opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-3))},
-                 lsgan=False, abc=(1,0,1), verbose=True):
+                 verbose=True):
         self.is_grayscale = is_grayscale
         self.in_shp = in_shp
         self.latent_dim = latent_dim
@@ -53,63 +52,54 @@ class ACGAN():
         self.discriminator = discriminator
         if verbose:
             self._print_network(generator['out'])
-            self._print_network(discriminator['out_dummy'])
-        if lsgan:
-            adv_loss = squared_error
-        else:
-            adv_loss = categorical_crossentropy
+            self._print_network(discriminator['out_disc'])
         z = T.fmatrix('z')
         yfake = T.fmatrix('yfake') # this gets fed into the generator
         y = T.fmatrix('y') # this gets fed into the discriminator
         x = T.tensor4('x')
         generator_out = get_output(
-            generator['out'], {generator['y_in']: yfake, generator['z_in']: z}
+            generator['out'], {generator['z_in']: z}
         )
         generator_out_det = get_output(
-            generator['out'], {generator['y_in']: yfake, generator['z_in']: z}, deterministic=True
+            generator['out'], {generator['z_in']: z}, deterministic=True
         )
         disc_out_real = get_output(discriminator['out_disc'], x)
         disc_out_real_det = get_output(discriminator['out_disc'], x, deterministic=True)
-        cls_out = get_output(discriminator['out_cls'], x)
-        cls_out_det = get_output(discriminator['out_cls'], x, deterministic=True)
-        cls_out_fake = get_output(discriminator['out_cls'], generator_out)
-        accuracy_cls_det = T.eq(T.argmax(cls_out_det,axis=1), T.argmax(y, axis=1)).mean()
         disc_out_gen = get_output(discriminator['out_disc'], generator_out)
         disc_out_gen_det = get_output(discriminator['out_disc'], generator_out_det, deterministic=True)
         accuracy_disc_det = T.eq(disc_out_real_det >= 0.5, y).mean()
         # auxiliary
         disc_latent_out_det = get_output(discriminator['out_disc'].input_layer, x, deterministic=True)
-        # distinguish between real and fake, and also classify the data correctly
-        disc_loss = adv_loss(disc_out_real, abc[0]).mean() + adv_loss(disc_out_gen, abc[1]).mean()
-        if cls_lambda > 0.:
-            disc_loss += cls_lambda*categorical_crossentropy(cls_out, y).mean()
-        # fool disc into thinking it's real, and also try and fool the classifier
-        gen_loss = adv_loss(disc_out_gen, abc[2]).mean()
-        if cls_lambda > 0.:
-            gen_loss += cls_lambda*categorical_crossentropy(cls_out_fake, yfake).mean()
+        # disc loss
+        disc_loss = disc_out_real.mean() - disc_out_gen.mean()
+        # gen loss
+        gen_loss = disc_out_gen.mean()
         # updates
         gen_params = get_all_params(generator['out'], trainable=True)
-        disc_params = get_all_params(discriminator['out_dummy'] if cls_lambda > 0. else discriminator['out_disc'], trainable=True)
-        updates = opt(gen_loss, gen_params, **opt_args)
-        updates.update(opt(disc_loss, disc_params, **opt_args))
+        disc_params = get_all_params(discriminator['out_disc'], trainable=True)
+        gen_updates = opt(-gen_loss, gen_params, **opt_args)
+        disc_updates = opt(-disc_loss, disc_params, **opt_args)
+        for param in get_all_params(discriminator['out_disc'], trainable=True, regularizable=True):
+            disc_updates[param] = T.clip(disc_updates[param], -0.01, 0.01)
         # functions
         if self.verbose:
             print "creating fns..."
-        fn_keys = [gen_loss, disc_loss, accuracy_cls_det]
-        self.train_keys = ['gen_loss', 'disc_loss', 'accuracy_cls']
-        self.train_fn = theano.function([z, yfake, x, y], fn_keys, updates=updates)
-        self.loss_fn = theano.function([z, yfake, x, y], fn_keys)
-        self.gen_fn = theano.function([z, yfake], generator_out)
-        self.gen_fn_det = theano.function([z, yfake], generator_out_det)
+        fn_keys = [gen_loss, disc_loss]
+        self.train_keys = ['gen_loss', 'disc_loss']
+        self.train_gen_fn = theano.function([z, x], fn_keys, updates=gen_updates)
+        self.train_disc_fn = theano.function([z, x], fn_keys, updates=disc_updates)
+        self.loss_fn = theano.function([z, x], fn_keys)
+        self.gen_fn = theano.function([z], generator_out)
+        self.gen_fn_det = theano.function([z], generator_out_det)
         self.disc_fn = theano.function([x], disc_out_real)
         self.disc_fn_det = theano.function([x], disc_out_real_det)
-        self.disc_acc = theano.function([x,y], accuracy_disc_det)
+        #self.disc_acc = theano.function([x,y], accuracy_disc_det)
         self.disc_latent_fn_det = theano.function([x], disc_latent_out_det)
         self.lr = opt_args['learning_rate']
     def save_model(self, filename):
         with gzip.open(filename, "wb") as g:
             pickle.dump({
-                'gen': get_all_param_values(self.generator['out']), 'disc': get_all_param_values(self.discriminator['out_dummy']),
+                'gen': get_all_param_values(self.generator['out']), 'disc': get_all_param_values(self.discriminator['out_disc']),
             }, g, pickle.HIGHEST_PROTOCOL )
     def load_model(self, filename):
         """
@@ -120,7 +110,7 @@ class ACGAN():
         with gzip.open(filename) as g:
             dd = pickle.load(g)
             set_all_param_values(self.generator['out'], dd['gen'])
-            set_all_param_values(self.discriminator['out_dummy'], dd['disc'])
+            set_all_param_values(self.discriminator['out_disc'], dd['disc'])
     def sample_yfake(self,batch_size):
         tmp = np.zeros((batch_size, self.num_classes))
         for i in range(tmp.shape[0]):
@@ -163,14 +153,21 @@ class ACGAN():
         schedule:
         quick_run:
         """
-        def _loop(fn, itr):
+        def _loop(gen_fn, disc_fn, itr):
             rec = [ [] for i in range(len(self.train_keys)) ]
+            num_examples = itr.N
             for b in range(itr.N // itr.bs):
                 # update idk vector
                 A_batch, B_batch = it_train.next()
                 yfake_batch = self.sample_yfake(itr.bs)
                 z_batch = self.sample_noise(itr.bs)
-                results = fn(z_batch, yfake_batch, A_batch, B_batch)
+                # update generator every 5 iters
+                if b % 5 == 0:
+                    #print "train gen"
+                    results = gen_fn(z_batch, A_batch)
+                else:
+                    #print "train d"
+                    results = disc_fn(z_batch, A_batch)
                 for i in range(len(results)):
                     rec[i].append(results[i])
                 if quick_run:
@@ -204,21 +201,23 @@ class ACGAN():
         #cb = ReduceLROnPlateau(self.lr,verbose=self.verbose)
         if self.verbose:
             print "training..."
+        initial_lr = self.lr.get_value()
         for e in range(num_epochs):
             try:
+                if e >= num_epochs // 2:
+                    progress = float(e) / num_epochs
+                    self.lr.set_value(floatX(initial_lr*2*(1 - progress)))
                 if e+1 in schedule:
                     self.lr.set_value( schedule[e+1] )
                 out_str = []
                 out_str.append(str(e+1))
                 t0 = time()
                 # training
-                results = _loop(self.train_fn, it_train)
+                results = _loop(self.train_gen_fn, self.train_disc_fn, it_train)
                 for i in range(len(results)):
                     out_str.append(str(results[i]))
-                if reduce_on_plateau:
-                    cb.on_epoch_end(np.mean(recon_losses), e+1)
                 # validation
-                results = _loop(self.loss_fn, it_val)
+                results = _loop(self.loss_fn, self.loss_fn, it_val)
                 for i in range(len(results)):
                     out_str.append(str(results[i]))
                 # binary validation
@@ -253,7 +252,7 @@ class ACGAN():
                         os.makedirs(path)
                 yfake_batch = self.sample_yfake(100)
                 z_batch = self.sample_noise(100)
-                gen_out = self.gen_fn_det(z_batch, yfake_batch)
+                gen_out = self.gen_fn_det(z_batch)
                 grid = np.zeros((self.in_shp*10, self.in_shp*10, 3))
                 ctr = 0
                 for i in range(10):
@@ -273,8 +272,7 @@ class ACGAN():
 def build_generator(latent_dim, is_grayscale, num_classes):
     # input: 100dim
     inp = InputLayer(shape=(None, 100))
-    y_input = InputLayer((None, num_classes))
-    layer = ConcatLayer((inp, y_input))
+    layer = inp
     # fully-connected layer
     layer = batch_norm(DenseLayer(layer, 1024))
     # project and reshape
@@ -285,7 +283,7 @@ def build_generator(latent_dim, is_grayscale, num_classes):
                                      output_size=14))
     layer = Deconv2DLayer(layer, 1 if is_grayscale else 3, 5, stride=2, crop='same', output_size=28,
                           nonlinearity=sigmoid if is_grayscale else tanh)
-    return {"z_in":inp, "y_in": y_input, "out": layer}
+    return {"z_in":inp, "out": layer}
 
 def build_critic(in_shp, is_grayscale, num_classes, out_nonlinearity):
     lrelu = LeakyRectify(0.2)
@@ -299,49 +297,10 @@ def build_critic(in_shp, is_grayscale, num_classes, out_nonlinearity):
     # fully-connected layer
     layer = batch_norm(DenseLayer(layer, 1024, nonlinearity=lrelu))
     # output layer for real/not real
-    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity)
-    l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
-    l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
-    return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
-
-def build_critic2(in_shp, is_grayscale, num_classes, out_nonlinearity):
-    lrelu = LeakyRectify(0.2)
-    # input: (None, 1, 28, 28)
-    layer = InputLayer(shape=(None, 1 if is_grayscale else 3, in_shp, in_shp))
-    # two convolutions
-    layer = batch_norm(Conv2DLayer(layer, 64, 3, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    layer = batch_norm(Conv2DLayer(layer, 128, 3, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    layer = batch_norm(Conv2DLayer(layer, 256, 3, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    layer = batch_norm(Conv2DLayer(layer, 512, 3, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    # fully-connected layer
-    layer = batch_norm(DenseLayer(layer, 512, nonlinearity=lrelu))
-    # output layer for real/not real
-    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity)
-    l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
-    l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
-    return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
+    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity, b=None)
+    return {"out_disc":l_out_disc}
 
 
-def build_critic3(in_shp, is_grayscale, num_classes, out_nonlinearity):
-    lrelu = LeakyRectify(0.2)
-    # input: (None, 1, 28, 28)
-    layer = InputLayer(shape=(None, 1 if is_grayscale else 3, in_shp, in_shp))
-    # two convolutions
-    layer = batch_norm(Conv2DLayer(layer, 64, 5, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    layer = batch_norm(Conv2DLayer(layer, 128, 5, stride=2, pad='same',
-                                   nonlinearity=lrelu))
-    # fully-connected layer
-    layer = batch_norm(DenseLayer(layer, 512, nonlinearity=lrelu))
-    # output layer for real/not real
-    l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity)
-    l_out_cls = DenseLayer(layer, num_classes, nonlinearity=softmax)
-    l_out_dummy = ConcatLayer([l_out_disc, l_out_cls])
-    return {"out_disc":l_out_disc, "out_cls":l_out_cls, "out_dummy":l_out_dummy}
 
 
 
@@ -467,6 +426,69 @@ if __name__ == '__main__':
         assert mode in ['train', 'dump']
         id_ = (1,)
         ood_ = (0,2,3,4,5,6,7,8,9,)
+        md = ACGAN(build_generator, {}, build_critic2, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True, lsgan=True,
+                   cls_lambda=0.)
+        itr_train = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
+        name = "test1b_1vsall_c2"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+
+    def test1b_1vsall_wgan(mode):
+        """
+        1 vs rest
+        """
+        assert mode in ['train', 'dump']
+        id_ = (1,)
+        ood_ = (0,2,3,4,5,6,7,8,9,)
+        md = ACGAN(build_generator, {}, build_critic2, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True,
+                   cls_lambda=0., opt=rmsprop, opt_args={'learning_rate':theano.shared(floatX(5e-5))})
+        itr_train = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
+        name = "test1b_1vsall_c2_wgan_decay"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=200, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+
+    def test1b_allvs0_wgan(mode):
+        """
+        1 vs rest
+        """
+        assert mode in ['train', 'dump']
+        ood_ = (0,)
+        id_ = (1,2,3,4,5,6,7,8,9,)
+        md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
+                   latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True,
+                   opt=rmsprop, opt_args={'learning_rate':theano.shared(floatX(5e-5))})
+        itr_train = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
+        itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
+        name = "test1b_allvs0_wgan_decay"
+        if mode == 'train':
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=200, out_dir="output/%s" % name, model_dir="models/%s" % name)
+        else:
+            pass
+
+        
+    def test1b_098vsall(mode):
+        """
+        1 vs rest
+        """
+        assert mode in ['train', 'dump']
+        id_ = (0,9,8,)
+        ood_ = (1,2,3,4,5,6,7)
         md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
                    latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True, lsgan=True,
                    cls_lambda=0.)
@@ -474,12 +496,11 @@ if __name__ == '__main__':
         itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
         itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
         itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
-        name = "test1b_1vsall"
+        name = "test1b_098vsall_c2"
         if mode == 'train':
-            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=100, out_dir="output/%s" % name, model_dir="models/%s" % name)
+            md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=200, out_dir="output/%s" % name, model_dir="models/%s" % name)
         else:
             pass
-
 
 
         
