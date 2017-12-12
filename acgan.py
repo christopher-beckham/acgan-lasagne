@@ -63,37 +63,34 @@ class ACGAN():
         generator_out_det = get_output(
             generator['out'], {generator['z_in']: z}, deterministic=True
         )
-        disc_out_real = get_output(discriminator['out_disc'], x)
-        disc_out_real_det = get_output(discriminator['out_disc'], x, deterministic=True)
-        disc_out_gen = get_output(discriminator['out_disc'], generator_out)
-        disc_out_gen_det = get_output(discriminator['out_disc'], generator_out_det, deterministic=True)
+        disc_bn = {'batch_norm_update_averages': False, 'batch_norm_use_averages':False}
+        disc_out_real = get_output(discriminator['out_disc'], x, **disc_bn)
+        disc_out_real_det = get_output(discriminator['out_disc'], x, deterministic=True, **disc_bn)
+        disc_out_gen = get_output(discriminator['out_disc'], generator_out, **disc_bn)
+        disc_out_gen_det = get_output(discriminator['out_disc'], generator_out_det, deterministic=True, **disc_bn)
         accuracy_disc_det = T.eq(disc_out_real_det >= 0.5, y).mean()
         # auxiliary
         disc_latent_out_det = get_output(discriminator['out_disc'].input_layer, x, deterministic=True)
         # disc loss
         disc_loss = disc_out_real.mean() - disc_out_gen.mean()
+        gp1 = squared_error( T.sum( T.grad(disc_out_real.mean(), x)**2, axis=(1,2,3) ), 1.).mean() # grad norm for real
         # gen loss
-        gen_loss = disc_out_gen.mean()
+        gen_loss = -disc_out_gen.mean()
         # updates
         gen_params = get_all_params(generator['out'], trainable=True)
         disc_params = get_all_params(discriminator['out_disc'], trainable=True)
-        gen_updates = opt(-gen_loss, gen_params, **opt_args)
-        disc_updates = opt(-disc_loss, disc_params, **opt_args)
-        for param in get_all_params(discriminator['out_disc'], trainable=True, regularizable=True):
-            disc_updates[param] = T.clip(disc_updates[param], -0.01, 0.01)
+        gen_updates = opt(gen_loss, gen_params, **opt_args)
+        disc_updates = opt(-disc_loss + 10.*gp1, disc_params, **opt_args)
         # functions
         if self.verbose:
             print "creating fns..."
-        fn_keys = [gen_loss, disc_loss]
-        self.train_keys = ['gen_loss', 'disc_loss']
+        fn_keys = [gen_loss, disc_loss, gp1]
+        self.train_keys = ['gen_loss', 'disc_loss', 'gp_loss']
         self.train_gen_fn = theano.function([z, x], fn_keys, updates=gen_updates)
         self.train_disc_fn = theano.function([z, x], fn_keys, updates=disc_updates)
         self.loss_fn = theano.function([z, x], fn_keys)
-        self.gen_fn = theano.function([z], generator_out)
         self.gen_fn_det = theano.function([z], generator_out_det)
-        self.disc_fn = theano.function([x], disc_out_real)
         self.disc_fn_det = theano.function([x], disc_out_real_det)
-        #self.disc_acc = theano.function([x,y], accuracy_disc_det)
         self.disc_latent_fn_det = theano.function([x], disc_latent_out_det)
         self.lr = opt_args['learning_rate']
     def save_model(self, filename):
@@ -269,9 +266,9 @@ class ACGAN():
 
 
 
-def build_generator(latent_dim, is_grayscale, num_classes):
+def build_generator(latent_dim, is_grayscale, num_classes, bs=None):
     # input: 100dim
-    inp = InputLayer(shape=(None, 100))
+    inp = InputLayer(shape=(None if bs == None else bs, 100))
     layer = inp
     # fully-connected layer
     layer = batch_norm(DenseLayer(layer, 1024))
@@ -285,17 +282,23 @@ def build_generator(latent_dim, is_grayscale, num_classes):
                           nonlinearity=sigmoid if is_grayscale else tanh)
     return {"z_in":inp, "out": layer}
 
-def build_critic(in_shp, is_grayscale, num_classes, out_nonlinearity):
+def build_critic(in_shp, is_grayscale, num_classes, out_nonlinearity, bs=None):
+    def layer_norm(x):
+        if len(x.output_shape) == 4:
+            return batch_norm(x, axes=(2,3))
+        else:
+            return batch_norm(x, axes=(1,))
+    # override function here
     lrelu = LeakyRectify(0.2)
     # input: (None, 1, 28, 28)
-    layer = InputLayer(shape=(None, 1 if is_grayscale else 3, in_shp, in_shp))
+    layer = InputLayer(shape=(None if bs == None else bs, 1 if is_grayscale else 3, in_shp, in_shp))
     # two convolutions
-    layer = batch_norm(Conv2DLayer(layer, 64, 5, stride=2, pad='same',
+    layer = layer_norm(Conv2DLayer(layer, 64, 5, stride=2, pad='same',
                                    nonlinearity=lrelu))
-    layer = batch_norm(Conv2DLayer(layer, 128, 5, stride=2, pad='same',
+    layer = layer_norm(Conv2DLayer(layer, 128, 5, stride=2, pad='same',
                                    nonlinearity=lrelu))
     # fully-connected layer
-    layer = batch_norm(DenseLayer(layer, 1024, nonlinearity=lrelu))
+    layer = layer_norm(DenseLayer(layer, 1024, nonlinearity=lrelu))
     # output layer for real/not real
     l_out_disc = DenseLayer(layer, 1, nonlinearity=out_nonlinearity, b=None)
     return {"out_disc":l_out_disc}
@@ -378,8 +381,7 @@ class MnistIterator():
                 if self.make_binary or self.num_classes==1:
                     this_y = floatX(this_y.reshape((len(this_y),1)))
                 else:
-                    this_y = floatX(np.eye(self.num_classes)[this_y])
-                    
+                    this_y = floatX(np.eye(self.num_classes)[this_y]) 
                 this_x = floatX(self.X_dat[b*self.bs:(b+1)*self.bs])
                 yield this_x, this_y
     def __iter__(self):
@@ -468,14 +470,15 @@ if __name__ == '__main__':
         assert mode in ['train', 'dump']
         ood_ = (0,)
         id_ = (1,2,3,4,5,6,7,8,9,)
-        md = ACGAN(build_generator, {}, build_critic, {'out_nonlinearity':linear},
+        bs = 128
+        md = ACGAN(build_generator, {'bs':bs}, build_critic, {'out_nonlinearity':linear, 'bs':bs},
                    latent_dim=100, num_classes=len(id_), in_shp=28, is_grayscale=True,
-                   opt=rmsprop, opt_args={'learning_rate':theano.shared(floatX(5e-5))})
-        itr_train = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
-        itr_valid = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
-        itr_train_disc = MnistIterator('train', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
-        itr_valid_disc = MnistIterator('valid', 128, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
-        name = "test1b_allvs0_wgan_decay"
+                   opt=adam, opt_args={'learning_rate':theano.shared(floatX(1e-4)), 'beta1':0., 'beta2':0.9})
+        itr_train = MnistIterator('train', bs, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_valid = MnistIterator('valid', bs, set1=id_, set2=ood_, mode='set1_mc') # 1 vs rest
+        itr_train_disc = MnistIterator('train', bs, set1=id_, set2=ood_, mode='set12_binary') # 0/1 train
+        itr_valid_disc = MnistIterator('valid', bs, set1=id_, set2=ood_, mode='set12_binary') # 0/1 valid
+        name = "test1b_allvs0_wgan-gp_decay_adam"
         if mode == 'train':
             md.train(itr_train, itr_valid, itr_train_disc, itr_valid_disc, num_epochs=200, out_dir="output/%s" % name, model_dir="models/%s" % name)
         else:
